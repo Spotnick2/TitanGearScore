@@ -18,7 +18,7 @@ local ADDON_NAME = ...
 local TITAN_GS_ID = "TitanGearScore"
 local TITAN_BUTTON = "TitanPanel" .. TITAN_GS_ID .. "Button"
 local _GetAddOnMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
-local TITAN_GS_VERSION = (_GetAddOnMetadata and _GetAddOnMetadata(ADDON_NAME, "Version")) or "2.1.0"
+local TITAN_GS_VERSION = (_GetAddOnMetadata and _GetAddOnMetadata(ADDON_NAME, "Version")) or "2.1.1"
 
 local floor = math.floor
 local format = string.format

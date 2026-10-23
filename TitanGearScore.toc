@@ -1,8 +1,8 @@
 ## Interface: 16001
-## Title: Titan Panel [|cffeda55fGearScore|r] |cff00aa002.1.0|r
+## Title: Titan Panel [|cffeda55fGearScore|r] |cff00aa002.1.1|r
 ## Notes: Displays your GearScore and average item level on Titan Panel.
 ## Author: Karuzo
-## Version: 2.1.0
+## Version: 2.1.1
 ## IconTexture: Interface\Icons\trade_engineering
 ## Dependencies: Titan
 TitanGearScore.lua

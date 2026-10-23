@@ -19,7 +19,7 @@ UnitName = function() return "Tester" end
 GetInventoryItemID = function(_, slot) return equipped[slot] end
 GetAverageItemLevel = function() return 60, 60 end
 IsShiftKeyDown = function() return false end
-C_AddOns = { GetAddOnMetadata = function() return "2.1.0" end }
+C_AddOns = { GetAddOnMetadata = function() return "2.1.1" end }
 C_Timer = { After = function(_, fn) timers[#timers + 1] = fn end }
 C_Item = {
     IsItemDataCachedByID = function(id) return cached[id] == true end,
