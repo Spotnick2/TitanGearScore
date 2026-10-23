@@ -3,7 +3,7 @@
 -- * TitanGearScore.lua
 -- *
 -- * Titan Panel plugin: displays your GearScore and average item level.
--- * Rewritten for TBC Classic Anniversary (2.5.5) / Interface 20505.
+-- * Ported to World of Warcraft: Forever (1.60.1) / Interface 16001.
 -- *
 -- * GearScore formula based on GearScoreLite by Mirrikat45 & TacoTip by kebabstorm.
 -- * Titan Panel integration modelled after TitanGold by the Titan Dev Team.
@@ -18,28 +18,17 @@ local ADDON_NAME = ...
 local TITAN_GS_ID = "TitanGearScore"
 local TITAN_BUTTON = "TitanPanel" .. TITAN_GS_ID .. "Button"
 local _GetAddOnMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
-local TITAN_GS_VERSION = (_GetAddOnMetadata and _GetAddOnMetadata(ADDON_NAME, "Version")) or "2.0.0"
+local TITAN_GS_VERSION = (_GetAddOnMetadata and _GetAddOnMetadata(ADDON_NAME, "Version")) or "2.1.0"
 
 local floor = math.floor
 local format = string.format
 
 -- ******************************** GearScore Engine ************************
 -- Self-contained GearScore calculator. No external libraries required.
--- Reads the player's own equipped items directly via GetInventoryItemLink.
+-- Reads the player's equipped item IDs through C_Item.
 
--- Detect bracket size from interface version (TBC Anniversary = 400)
-local BRACKET_SIZE
-do
-    local _, _, _, tocVersion = GetBuildInfo()
-    tocVersion = tonumber(tocVersion) or 0
-    if tocVersion >= 30000 then
-        BRACKET_SIZE = 1000 -- Wrath
-    elseif tocVersion >= 20000 then
-        BRACKET_SIZE = 400  -- TBC / TBC Anniversary
-    else
-        BRACKET_SIZE = 200  -- Classic Era
-    end
-end
+-- Forever has Vanilla gear, so it uses the Classic GearScore brackets.
+local BRACKET_SIZE = 200
 
 local MAX_SCORE = BRACKET_SIZE * 6 - 1
 
@@ -145,12 +134,12 @@ local function GetScoreColor(score)
     return 0.1, 0.1, 0.1, "Trash"
 end
 
---- Score a single item link.
----@param itemLink string
+--- Score loaded item data.
+---@param itemRarity number
+---@param itemLevel number
+---@param itemEquipLoc string
 ---@return number gearScore, number itemLevel, number r, number g, number b, string|nil equipLoc
-local function ScoreItem(itemLink)
-    if not itemLink then return 0, 0, 0.1, 0.1, 0.1, nil end
-    local _, _, ItemRarity, ItemLevel, _, _, _, _, ItemEquipLoc = GetItemInfo(itemLink)
+local function ScoreItem(ItemRarity, ItemLevel, ItemEquipLoc)
     if not (ItemRarity and ItemLevel and ItemEquipLoc and GS_ItemTypes[ItemEquipLoc]) then
         return 0, 0, 0.1, 0.1, 0.1, nil
     end
@@ -191,7 +180,7 @@ local function ScoreItem(itemLink)
         return gs, floor(origLevel), r, g, b, ItemEquipLoc
     end
 
-    return 0, 0, 0.1, 0.1, 0.1, ItemEquipLoc
+    return 0, 0, 0.1, 0.1, 0.1, nil
 end
 
 -- Slot scan order: head(1), neck(2), shoulder(3), chest(5), waist(6), legs(7),
@@ -223,7 +212,7 @@ local SLOT_NAMES = {
 -- ******************************** Bar Gradient ****************************
 -- Smooth gradient following WoW's item quality color ramp:
 -- Gray (Poor) → White (Common) → Green (Uncommon) → Blue (Rare) → Purple (Epic) → Orange (Legendary)
--- Mapped to GearScore brackets (TBC: 0-400-800-1200-1600-2000-2400).
+-- Mapped to Classic GearScore brackets (0-200-400-600-800-1000-1200).
 
 local GRADIENT_STOPS = {
     --  score threshold,          R,    G,    B
@@ -261,98 +250,180 @@ end
 
 -- Cached results, refreshed on gear change
 local cachedGearScore = 0
-local cachedAvgILevel = 0
+local cachedAvgILevel = nil
 local cachedSlotScores = {}
-local cachedR, cachedG, cachedB = 1, 1, 1       -- quality bracket color (tooltip)
 local cachedBarR, cachedBarG, cachedBarB = 1, 1, 1 -- smooth gradient color (bar)
 local cachedDesc = ""
+local cachedScoredCount, cachedLoading, cachedUnreadable, cachedUnscored = 0, 0, 0, 0
 local cacheReady = false
 
---- Recalculate player's total GearScore from equipped items.
+-- Forever may return secret item values in combat. Check before comparing or
+-- formatting any client value.
+local function Plain(value)
+    if issecretvalue and issecretvalue(value) then return nil end
+    return value
+end
+
+local pending, failed = {}, {}
+local loader = CreateFrame("Frame")
+local listening = false
+local LOAD_EVENTS = { "ITEM_DATA_LOAD_RESULT", "GET_ITEM_INFO_RECEIVED" }
+
+local function ListenForItems(on)
+    if listening == on then return end
+    listening = on
+    for _, event in ipairs(LOAD_EVENTS) do
+        if on then loader:RegisterEvent(event) else loader:UnregisterEvent(event) end
+    end
+end
+
+local function RequestItem(id)
+    if pending[id] then return end
+    pending[id] = true
+    ListenForItems(true)
+    C_Item.RequestLoadItemDataByID(id)
+end
+
+local function ReadSlot(slot)
+    local rawID = GetInventoryItemID("player", slot)
+    local id = Plain(rawID)
+    if not id then
+        if issecretvalue and issecretvalue(rawID) then return "unreadable" end
+        return "empty"
+    end
+    if failed[id] then return "unreadable" end
+    if pending[id] or Plain(C_Item.IsItemDataCachedByID(id)) ~= true then
+        RequestItem(id)
+        return "loading"
+    end
+
+    local _, _, rawQuality, rawLevel = C_Item.GetItemInfo(id)
+    local quality, level = Plain(rawQuality), Plain(rawLevel)
+    if type(quality) ~= "number" or type(level) ~= "number" then
+        if (issecretvalue and (issecretvalue(rawQuality) or issecretvalue(rawLevel))) then
+            return "unreadable"
+        end
+        RequestItem(id) -- cache entry was evicted between the two calls
+        return "loading"
+    end
+    local _, _, _, rawEquipLoc = C_Item.GetItemInfoInstant(id)
+    local equipLoc = Plain(rawEquipLoc)
+    if type(equipLoc) ~= "string" then return "unreadable" end
+    return quality, level, equipLoc
+end
+
 local function RecalcScore()
-    local _, enClass = UnitClass("player")
-    local totalGS = 0
-    local totalIL = 0
-    local itemCount = 0
+    local _, rawClass = UnitClass("player")
+    local enClass = Plain(rawClass)
+    local totalGS, itemCount = 0, 0
+    local loading, unreadable, unscored = 0, 0, 0
     local slotData = {}
 
-    -- Pre-read weapon links for TitanGrip detection
-    local mainLink = GetInventoryItemLink("player", 16)
-    local offLink  = GetInventoryItemLink("player", 17)
-    local titanGrip = 1
-    if mainLink and offLink then
-        local _, _, _, _, _, _, _, _, mhEquipLoc = GetItemInfo(mainLink)
-        if mhEquipLoc == "INVTYPE_2HWEAPON" then titanGrip = 0.5 end
-    end
-    if offLink then
-        local _, _, _, _, _, _, _, _, ohEquipLoc = GetItemInfo(offLink)
-        if ohEquipLoc == "INVTYPE_2HWEAPON" then titanGrip = 0.5 end
-    end
-
-    -- Score offhand first (separate from main loop to handle TitanGrip)
-    if offLink then
-        local gs, il, r, g, b, equipLoc = ScoreItem(offLink)
-        if enClass == "HUNTER" then gs = floor(gs * 0.3164) end
-        gs = floor(gs * titanGrip)
-        totalGS = totalGS + gs
-        itemCount = itemCount + 1
-        totalIL = totalIL + il
-        slotData[17] = { score = gs, ilvl = il, r = r, g = g, b = b }
-    end
-
-    -- Score all other slots (excluding offhand=17 which is handled above, and shirt=4)
     for _, slot in ipairs(SCAN_SLOTS) do
-        if slot ~= 17 then -- offhand already scored
-            local link = GetInventoryItemLink("player", slot)
-            if link then
-                local gs, il, r, g, b, equipLoc = ScoreItem(link)
-                -- Hunter adjustments
+        local quality, level, equipLoc = ReadSlot(slot)
+        if quality == "loading" then
+            loading = loading + 1
+            slotData[slot] = "loading"
+        elseif quality == "unreadable" then
+            unreadable = unreadable + 1
+            slotData[slot] = "unreadable"
+        elseif type(quality) == "number" then
+            local gs, il, r, g, b, scoredLoc = ScoreItem(quality, level, equipLoc)
+            if scoredLoc then
                 if enClass == "HUNTER" then
-                    if slot == 16 then
-                        gs = floor(gs * 0.3164)
-                    elseif slot == 18 then
-                        gs = floor(gs * 5.3224)
-                    end
-                end
-                -- TitanGrip on mainhand
-                if slot == 16 then
-                    gs = floor(gs * titanGrip)
+                    if slot == 16 or slot == 17 then gs = floor(gs * 0.3164)
+                    elseif slot == 18 then gs = floor(gs * 5.3224) end
                 end
                 totalGS = totalGS + gs
                 itemCount = itemCount + 1
-                totalIL = totalIL + il
                 slotData[slot] = { score = gs, ilvl = il, r = r, g = g, b = b }
+            else
+                unscored = unscored + 1
+                slotData[slot] = "unscored"
             end
         end
     end
 
-    if totalGS > 0 and itemCount > 0 then
-        cachedGearScore = floor(totalGS)
-        cachedAvgILevel = floor(totalIL / itemCount)
-    else
-        cachedGearScore = 0
-        cachedAvgILevel = 0
-    end
-
-    cachedR, cachedG, cachedB, cachedDesc = GetScoreColor(cachedGearScore)
-    cachedBarR, cachedBarG, cachedBarB = GetBarGradient(cachedGearScore)
+    -- This is Blizzard's equipped average, independent of GearScore's slot
+    -- weights and still meaningful while some item data is loading.
+    local ok, _, equipped = pcall(GetAverageItemLevel)
+    equipped = ok and Plain(equipped) or nil
+    cachedAvgILevel = type(equipped) == "number" and floor(equipped + 0.5) or nil
+    cachedGearScore = totalGS
+    cachedScoredCount, cachedLoading, cachedUnreadable, cachedUnscored = itemCount, loading, unreadable, unscored
+    _, _, _, cachedDesc = GetScoreColor(totalGS)
+    cachedBarR, cachedBarG, cachedBarB = GetBarGradient(totalGS)
     cachedSlotScores = slotData
     cacheReady = true
+end
+
+local scanError = nil
+local function RefreshScore()
+    local ok, err = pcall(RecalcScore)
+    if ok then
+        scanError = nil
+    else
+        cacheReady = false
+        cachedAvgILevel = nil
+        local message = Plain(err)
+        scanError = type(message) == "string" and message or "Gear data unavailable"
+    end
+end
+
+loader:SetScript("OnEvent", function(_, _, rawID, rawSuccess)
+    local id = Plain(rawID)
+    if id and pending[id] then
+        pending[id] = nil
+        if Plain(rawSuccess) == false then failed[id] = true end
+        -- The item can finish loading while the Titan button is hidden.
+        RefreshScore()
+        TitanPanelButton_UpdateButton(TITAN_GS_ID)
+    end
+    if not next(pending) then ListenForItems(false) end
+end)
+
+local refreshQueued = false
+local function ScheduleRecalc()
+    if refreshQueued then return end
+    refreshQueued = true
+    C_Timer.After(0.1, function()
+        refreshQueued = false
+        RefreshScore()
+        TitanPanelButton_UpdateButton(TITAN_GS_ID)
+    end)
+end
+
+local function ResetItemLoads()
+    pending, failed = {}, {}
+    ListenForItems(false)
 end
 
 -- ******************************** Titan Panel Integration *****************
 -- Follows the same Create_Frames / OnLoad / OnShow / OnEvent pattern as TitanGold.
 
+local function ScoreText()
+    local incomplete = cachedLoading + cachedUnreadable > 0
+    if not cacheReady or (cachedScoredCount == 0 and incomplete) then return "|cff888888?|r" end
+    local text = format("|cff%02x%02x%02x%d|r", cachedBarR * 255, cachedBarG * 255, cachedBarB * 255, cachedGearScore)
+    return incomplete and text .. "|cff888888?|r" or text
+end
+
+local function ColoredPlayerName()
+    local name = Plain(UnitName("player")) or "Player"
+    local class = Plain(select(2, UnitClass("player")))
+    local color = class and RAID_CLASS_COLORS[class]
+    if color then
+        return format("|cff%02x%02x%02x%s|r", color.r * 255, color.g * 255, color.b * 255, name)
+    end
+    return name
+end
+
 ---Build the button text shown on the Titan bar.
 local function GetButtonText(id)
-    if not cacheReady then
-        return "GearScore" .. ": " .. FONT_COLOR_CODE_CLOSE, TitanUtils_GetHighlightText("...")
-    end
-
-    local gsText = format("|cff%02x%02x%02x%d|r", cachedBarR * 255, cachedBarG * 255, cachedBarB * 255, cachedGearScore)
+    local gsText = ScoreText()
 
     if TitanGetVar(TITAN_GS_ID, "ShowAvgILevel") then
-        return "GearScore" .. ": " .. FONT_COLOR_CODE_CLOSE, gsText .. "  " .. TitanUtils_GetNormalText("iLvl: ") .. TitanUtils_GetHighlightText(cachedAvgILevel)
+        return "GearScore" .. ": " .. FONT_COLOR_CODE_CLOSE, gsText .. "  " .. TitanUtils_GetNormalText("iLvl: ") .. TitanUtils_GetHighlightText(cachedAvgILevel or "?")
     end
 
     return "GearScore" .. ": " .. FONT_COLOR_CODE_CLOSE, gsText
@@ -363,21 +434,19 @@ local function GetTooltipText()
     local lines = ""
 
     if not cacheReady then
-        return "Calculating score...\nEquip or swap an item to trigger an update."
+        return scanError and ("Unable to read gear: " .. scanError) or "Calculating score...\nEquip or swap an item to trigger an update."
     end
 
     -- Player info
-    local classColor = RAID_CLASS_COLORS[select(2, UnitClass("player"))]
-    local playerName = UnitName("player")
-    if classColor then
-        playerName = format("|cff%02x%02x%02x%s|r", classColor.r * 255, classColor.g * 255, classColor.b * 255, playerName)
-    end
-
-    lines = lines .. playerName .. "\n"
-    lines = lines .. TitanUtils_GetNormalText("GearScore: ") .. format("|cff%02x%02x%02x%d|r", cachedBarR * 255, cachedBarG * 255, cachedBarB * 255, cachedGearScore)
-    lines = lines .. "  (" .. cachedDesc .. ")\n"
-    lines = lines .. TitanUtils_GetNormalText("Avg Item Level: ") .. TitanUtils_GetHighlightText(cachedAvgILevel) .. "\n"
-    lines = lines .. TitanUtils_GetNormalText("Items Scored: ") .. TitanUtils_GetHighlightText(#SCAN_SLOTS > 0 and tostring(#SCAN_SLOTS) or "0") .. "\n"
+    lines = lines .. ColoredPlayerName() .. "\n"
+    lines = lines .. TitanUtils_GetNormalText("GearScore: ") .. ScoreText()
+    if cachedScoredCount > 0 then lines = lines .. "  (" .. cachedDesc .. ")" end
+    lines = lines .. "\n"
+    lines = lines .. TitanUtils_GetNormalText("Avg Item Level: ") .. TitanUtils_GetHighlightText(cachedAvgILevel or "?") .. "\n"
+    lines = lines .. TitanUtils_GetNormalText("Items Scored: ") .. TitanUtils_GetHighlightText(cachedScoredCount) .. "\n"
+    if cachedLoading > 0 then lines = lines .. TitanUtils_GetNormalText(cachedLoading .. " item(s) still loading; excluded from score.") .. "\n" end
+    if cachedUnreadable > 0 then lines = lines .. TitanUtils_GetNormalText(cachedUnreadable .. " item(s) unreadable; excluded from score.") .. "\n" end
+    if cachedUnscored > 0 then lines = lines .. TitanUtils_GetNormalText(cachedUnscored .. " item(s) have no GearScore.") .. "\n" end
 
     -- Separator
     lines = lines .. " \n"
@@ -387,11 +456,12 @@ local function GetTooltipText()
     for _, slot in ipairs(SCAN_SLOTS) do
         local name = SLOT_NAMES[slot] or ("Slot " .. slot)
         local data = cachedSlotScores[slot]
-        if data then
+        if type(data) == "table" then
             local scoreStr = format("|cff%02x%02x%02x%d|r", data.r * 255, data.g * 255, data.b * 255, data.score)
             lines = lines .. TitanUtils_GetNormalText(name .. ": ") .. scoreStr .. "  (iLvl " .. data.ilvl .. ")\n"
         else
-            lines = lines .. TitanUtils_GetNormalText(name .. ": ") .. TitanUtils_GetRedText("Empty") .. "\n"
+            local status = data == "loading" and "Loading" or data == "unreadable" and "Unreadable" or data == "unscored" and "Unscored" or "Empty"
+            lines = lines .. TitanUtils_GetNormalText(name .. ": ") .. TitanUtils_GetRedText(status) .. "\n"
         end
     end
 
@@ -406,7 +476,7 @@ end
 local function CreateMenu(id)
     -- Level 1
     if TitanPanelRightClickMenu_GetDropdownLevel() == 1 then
-        TitanPanelRightClickMenu_AddTitle(TitanPlugins[id].menuText)
+        TitanPanelRightClickMenu_AddTitle("GearScore")
         TitanPanelRightClickMenu_AddSpacer()
 
         local info = {}
@@ -417,14 +487,14 @@ local function CreateMenu(id)
         end
         info.checked = TitanGetVar(TITAN_GS_ID, "ShowAvgILevel")
         info.keepShownOnClick = 1
-        L_UIDropDownMenu_AddButton(info)
+        TitanPanelRightClickMenu_AddButton(info)
 
         TitanPanelRightClickMenu_AddSpacer()
         TitanPanelRightClickMenu_AddToggleIcon(id)
         TitanPanelRightClickMenu_AddToggleLabelText(id)
 
         TitanPanelRightClickMenu_AddSpacer()
-        TitanPanelRightClickMenu_AddCommand(TITAN_PANEL_MENU_HIDE, id, TITAN_PANEL_MENU_FUNC_HIDE)
+        TitanPanelRightClickMenu_AddHide(id)
     end
 end
 
@@ -463,12 +533,15 @@ end
 
 ---@param self Button
 local function OnShow(self)
-    -- Register gear-change events
+    -- Keep the button current while it is displayed on a Titan bar.
     self:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
     self:RegisterEvent("UNIT_INVENTORY_CHANGED")
+    self:RegisterEvent("PLAYER_ENTERING_WORLD")
+    self:RegisterEvent("PLAYER_AVG_ITEM_LEVEL_UPDATE")
+    self:RegisterEvent("PLAYER_REGEN_ENABLED")
 
     -- Initial calculation
-    RecalcScore()
+    RefreshScore()
     TitanPanelButton_UpdateButton(TITAN_GS_ID)
 end
 
@@ -476,6 +549,9 @@ end
 local function OnHide(self)
     self:UnregisterEvent("PLAYER_EQUIPMENT_CHANGED")
     self:UnregisterEvent("UNIT_INVENTORY_CHANGED")
+    self:UnregisterEvent("PLAYER_ENTERING_WORLD")
+    self:UnregisterEvent("PLAYER_AVG_ITEM_LEVEL_UPDATE")
+    self:UnregisterEvent("PLAYER_REGEN_ENABLED")
 end
 
 ---@param self Button
@@ -486,26 +562,14 @@ local function OnEvent(self, event, a1, ...)
         if a1 == ADDON_NAME then
             self:UnregisterEvent("ADDON_LOADED")
 
-            -- Do an initial score calc after a small delay to let item cache warm
-            C_Timer.After(1, function()
-                RecalcScore()
-                TitanPanelButton_UpdateButton(TITAN_GS_ID)
-            end)
+            ScheduleRecalc()
         end
-    elseif event == "PLAYER_EQUIPMENT_CHANGED" then
-        -- a1 = equipmentSlot, fires per slot
-        -- Short delay to batch multiple swaps (e.g. equipment manager)
-        C_Timer.After(0.3, function()
-            RecalcScore()
-            TitanPanelButton_UpdateButton(TITAN_GS_ID)
-        end)
-    elseif event == "UNIT_INVENTORY_CHANGED" then
-        if a1 == "player" then
-            C_Timer.After(0.3, function()
-                RecalcScore()
-                TitanPanelButton_UpdateButton(TITAN_GS_ID)
-            end)
-        end
+    elseif event == "PLAYER_EQUIPMENT_CHANGED" or event == "PLAYER_ENTERING_WORLD"
+        or (event == "UNIT_INVENTORY_CHANGED" and Plain(a1) == "player") then
+        ResetItemLoads()
+        ScheduleRecalc()
+    elseif event == "PLAYER_AVG_ITEM_LEVEL_UPDATE" or event == "PLAYER_REGEN_ENABLED" then
+        ScheduleRecalc()
     end
 end
 
@@ -513,14 +577,7 @@ end
 ---@param button string
 local function OnClick(self, button)
     if button == "LeftButton" and IsShiftKeyDown() then
-        -- Print score to chat
-        local classColor = RAID_CLASS_COLORS[select(2, UnitClass("player"))]
-        local name = UnitName("player")
-        if classColor then
-            name = format("|cff%02x%02x%02x%s|r", classColor.r * 255, classColor.g * 255, classColor.b * 255, name)
-        end
-        local gsColored = format("|cff%02x%02x%02x%d|r", cachedBarR * 255, cachedBarG * 255, cachedBarB * 255, cachedGearScore)
-        print(name .. " - GearScore: " .. gsColored .. " (Avg iLvl: " .. cachedAvgILevel .. ")")
+        print(ColoredPlayerName() .. " - GearScore: " .. ScoreText() .. " (Avg iLvl: " .. (cachedAvgILevel or "?") .. ")")
     end
 end
 
@@ -578,13 +635,8 @@ SLASH_TITANGEARSCORE1 = "/tgs"
 SLASH_TITANGEARSCORE2 = "/titangs"
 SlashCmdList["TITANGEARSCORE"] = function(msg)
     if not cacheReady then
-        RecalcScore()
+        RefreshScore()
     end
-    local classColor = RAID_CLASS_COLORS[select(2, UnitClass("player"))]
-    local name = UnitName("player")
-    if classColor then
-        name = format("|cff%02x%02x%02x%s|r", classColor.r * 255, classColor.g * 255, classColor.b * 255, name)
-    end
-    local gsColored = format("|cff%02x%02x%02x%d|r", cachedBarR * 255, cachedBarG * 255, cachedBarB * 255, cachedGearScore)
-    print(name .. " - GearScore: " .. gsColored .. " (" .. cachedDesc .. ") - Avg iLvl: " .. cachedAvgILevel)
+    local bracket = cachedScoredCount > 0 and (" (" .. cachedDesc .. ")") or ""
+    print(ColoredPlayerName() .. " - GearScore: " .. ScoreText() .. bracket .. " - Avg iLvl: " .. (cachedAvgILevel or "?"))
 end
